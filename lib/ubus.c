@@ -2522,9 +2522,6 @@ uc_ubus_handle_reply_common(struct ubus_context *ctx,
 	/* release request object */
 	ucv_put(reqobj);
 
-	/* garbage collect */
-	ucv_gc(vm);
-
 	return UBUS_STATUS_OK;
 }
 
