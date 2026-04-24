@@ -150,6 +150,7 @@ function run_testcase(num, dir, testcase) {
 		`-T','`,
 		`-L ${shellquote(`${ucode_lib}/*.so`)}`,
 		`-D TESTFILES_PATH=${shellquote(`${fs.realpath(dir)}/files`)}`,
+		`-D UCODE_BIN=${shellquote(`${ucode_bin}`)}`,
 		`${join(' ', map(testcase.args ?? [], shellquote))} -`,
 		`>/dev/fd/${fout.fileno()} 2>/dev/fd/${ferr.fileno()}`
 	]);
