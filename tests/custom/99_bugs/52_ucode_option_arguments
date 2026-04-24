@@ -1,0 +1,31 @@
+Test that ucode scripts can receive option arguments via ARGV.
+
+-- Testcase --
+{%
+	// Strip valgrind from UCODE_BIN
+	let ucode = UCODE_BIN;
+	let i = rindex(ucode, ' ');
+	if (i > -1)
+		ucode = substr(ucode, i + 1);
+
+	system([ ucode, TESTFILES_PATH + '/testscripts/hello.uc', '--option', 'otherarg']);
+%}
+-- End --
+
+-- File testscripts/hello.uc --
+#!/usr/bin/ucode
+
+print("This is our test program running!\n");
+print("My arguments are:\n");
+
+for (arg in ARGV) {
+	print(`<${arg}>\n`);
+}
+-- End --
+
+-- Expect stdout --
+This is our test program running!
+My arguments are:
+<--option>
+<otherarg>
+-- End --

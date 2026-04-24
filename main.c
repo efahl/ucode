@@ -33,6 +33,12 @@
 #include "ucode/source.h"
 #include "ucode/program.h"
 
+#ifdef __GLIBC__
+# define POSIXLY_CORRECT_FLAG "+"
+#else
+# define POSIXLY_CORRECT_FLAG ""
+#endif
+
 static FILE *stdin_unused;
 
 static void
@@ -507,7 +513,7 @@ appname(const char *argv0)
 int
 main(int argc, char **argv)
 {
-	const char *optspec = "he:p:tg:ST::RD:F:U:l:L:c::o:s";
+	const char *optspec = POSIXLY_CORRECT_FLAG "he:p:tg:ST::RD:F:U:l:L:c::o:s";
 	bool strip = false, print_result = false;
 	char *interp = "/usr/bin/env ucode";
 	uc_source_t *source = NULL;
