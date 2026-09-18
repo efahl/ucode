@@ -1142,6 +1142,10 @@ uc_ubus_call_cb(struct ubus_request *req, int type, struct blob_attr *msg)
 	else if (!res->res) {
 		res->res = val;
 	}
+	else {
+		/* single-return mode keeps the first reply only */
+		ucv_put(val);
+	}
 }
 
 static void
