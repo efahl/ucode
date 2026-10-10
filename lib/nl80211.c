@@ -92,6 +92,16 @@ limitations under the License.
 
 #define NL80211_CMDS_BITMAP_SIZE	DIV_ROUND_UP(NL80211_CMD_MAX + 1, 32)
 
+#define NL80211_EVSOCK_RCVBUF_INIT	(1024 * 1024)
+#define NL80211_EVSOCK_RCVBUF_MAX	(8 * 1024 * 1024)
+
+enum {
+	LISTENER_SLOT_RES,
+	LISTENER_SLOT_CB,
+	LISTENER_SLOT_OVERRUN_CB,
+	LISTENER_SLOTS
+};
+
 static struct {
 	int code;
 	char *msg;
@@ -920,7 +930,7 @@ static const uc_nl_nested_spec_t nl80211_wiphy_radio_nla = {
 
 static const uc_nl_nested_spec_t nl80211_mlo_link_nla = {
 	.headsize = 0,
-	.nattrs = 12,
+	.nattrs = 13,
 	.attrs = {
 		{ NL80211_ATTR_MLO_LINK_ID, "link_id", DT_U8, 0, NULL },
 		{ NL80211_ATTR_MAC, "mac", DT_LLADDR, 0, NULL },
@@ -934,12 +944,13 @@ static const uc_nl_nested_spec_t nl80211_mlo_link_nla = {
 		{ NL80211_ATTR_MLO_TTLM_DLINK, "mlo_ttlm_dlink", DT_STRING, DF_BINARY, NULL },
 		{ NL80211_ATTR_MLO_TTLM_ULINK, "mlo_ttlm_ulink", DT_STRING, DF_BINARY, NULL },
 		{ NL80211_ATTR_PUNCT_BITMAP, "punct_bitmap", DT_U32, 0, NULL },
+		{ NL80211_ATTR_STA_INFO, "sta_info", DT_NESTED, 0, &nl80211_sta_info_nla },
 	}
 };
 
 static const uc_nl_nested_spec_t nl80211_msg = {
 	.headsize = 0,
-	.nattrs = 138,
+	.nattrs = 139,
 	.attrs = {
 		{ NL80211_ATTR_4ADDR, "4addr", DT_U8, 0, NULL },
 		{ NL80211_ATTR_AIRTIME_WEIGHT, "airtime_weight", DT_U16, 0, NULL },
@@ -1079,6 +1090,7 @@ static const uc_nl_nested_spec_t nl80211_msg = {
 		{ NL80211_ATTR_SURVEY_INFO, "survey_info", DT_NESTED, 0, &nl80211_survey_info_nla },
 		{ NL80211_ATTR_WIPHY_RADIOS, "radios", DT_NESTED, DF_MULTIPLE|DF_AUTOIDX, &nl80211_wiphy_radio_nla },
 		{ NL80211_ATTR_VIF_RADIO_MASK, "vif_radio_mask", DT_U32, 0, NULL },
+		{ NL80211_ATTR_STA_DUMP_LINK_STATS, "sta_dump_link_stats", DT_FLAG, 0, NULL },
 	}
 };
 
@@ -2118,12 +2130,18 @@ uc_nl_convert_attr(const uc_nl_attr_spec_t *spec, struct nl_msg *msg, char *base
 }
 
 
+uc_declare_vector(uc_nl_msgs_t, struct nl_msg *);
+
 static struct {
 	struct nl_sock *sock;
 	struct nl_sock *evsock;
 	struct nl_cache *cache;
 	struct uloop_fd evsock_fd;
 	struct nl_cb *evsock_cb;
+	struct uloop_timeout overrun_timer;
+	struct uloop_timeout pending_timer;
+	uc_nl_msgs_t pending;
+	int rcvbuf;
 } nl80211_conn;
 
 typedef enum {
@@ -2191,6 +2209,19 @@ static int
 cb_done(struct nl_msg *msg, void *arg)
 {
 	request_state_t *s = arg;
+
+	s->state = STATE_REPLIED;
+
+	return NL_STOP;
+}
+
+static int
+cb_done_ack(struct nl_msg *msg, void *arg)
+{
+	request_state_t *s = arg;
+
+	if (s->state == STATE_UNREPLIED)
+		s->res = ucv_boolean_new(true);
 
 	s->state = STATE_REPLIED;
 
@@ -2538,9 +2569,9 @@ cb_listener_event(struct nl_msg *msg, void *arg)
 	if (!nl80211_conn.evsock_fd.registered || !vm)
 		return NL_SKIP;
 
-	for (size_t i = 0; i < ucv_array_length(listener_registry); i += 2) {
-		uc_value_t *this = ucv_array_get(listener_registry, i);
-		uc_value_t *func = ucv_array_get(listener_registry, i + 1);
+	for (size_t i = 0; i < ucv_array_length(listener_registry); i += LISTENER_SLOTS) {
+		uc_value_t *this = ucv_array_get(listener_registry, i + LISTENER_SLOT_RES);
+		uc_value_t *func = ucv_array_get(listener_registry, i + LISTENER_SLOT_CB);
 		uc_nl_listener_t *l;
 		uc_value_t *o, *data;
 
@@ -2578,17 +2609,79 @@ cb_listener_event(struct nl_msg *msg, void *arg)
 	return NL_SKIP;
 }
 
+static void
+uc_nl_pending_deliver(struct uloop_timeout *t)
+{
+	uc_nl_msgs_t *pending = &nl80211_conn.pending;
+	int rv = NL_SKIP;
+	size_t i = 0;
+
+	while (i < pending->count && rv != NL_STOP)
+		rv = cb_listener_event(pending->entries[i++], NULL);
+
+	for (size_t j = 0; j < i; j++)
+		nlmsg_free(pending->entries[j]);
+
+	pending->count -= i;
+
+	if (!pending->count) {
+		uc_vector_clear(pending);
+		return;
+	}
+
+	memmove(pending->entries, pending->entries + i,
+	        pending->count * sizeof(*pending->entries));
+	uloop_timeout_set(t, 0);
+}
+
+static void
+uc_nl_listener_defer(struct nl_msg *msg)
+{
+	struct nl_msg *copy;
+
+	if (!nl80211_conn.evsock_fd.registered || !listener_vm)
+		return;
+
+	copy = nlmsg_convert(nlmsg_hdr(msg));
+
+	if (!copy)
+		return;
+
+	uc_vector_push(&nl80211_conn.pending, copy);
+
+	nl80211_conn.pending_timer.cb = uc_nl_pending_deliver;
+	uloop_timeout_set(&nl80211_conn.pending_timer, 0);
+}
+
+/* events deferred by a request must reach the listeners first */
+static int
+cb_listener_dispatch(struct nl_msg *msg, void *arg)
+{
+	if (!nl80211_conn.pending.count)
+		return cb_listener_event(msg, arg);
+
+	uc_nl_listener_defer(msg);
+
+	return NL_SKIP;
+}
+
+/*
+ * nl80211 sends every event with sequence 0. A listener callback can
+ * issue requests itself, so it must not run inside a request.
+ */
 static int
 cb_evsock_msg(struct nl_msg *msg, void *arg)
 {
 	struct nlmsghdr *hdr = nlmsg_hdr(msg);
+	uint32_t req_seq = arg ? *(uint32_t *)arg : 0;
 
-	if (hdr->nlmsg_seq == 0) {
-		cb_listener_event(msg, NULL);
-		return NL_SKIP;
-	}
+	if (hdr->nlmsg_seq == req_seq)
+		return NL_OK;
 
-	return NL_OK;
+	if (hdr->nlmsg_seq == 0)
+		uc_nl_listener_defer(msg);
+
+	return NL_SKIP;
 }
 
 static int
@@ -2599,7 +2692,7 @@ cb_event(struct nl_msg *msg, void *arg)
 	struct waitfor_ctx *s = arg;
 	uc_value_t *o;
 
-	cb_listener_event(msg, arg);
+	cb_listener_dispatch(msg, arg);
 
 	if (gnlh->cmd > NL80211_CMD_MAX ||
 	    !(s->cmds[gnlh->cmd / 32] & (1 << (gnlh->cmd % 32))))
@@ -2656,6 +2749,82 @@ uc_nl_fill_cmds(uint32_t *cmd_bits, uc_value_t *cmds)
 	return true;
 }
 
+static void
+uc_nl_listener_overrun_notify(struct uloop_timeout *t)
+{
+	uc_vm_t *vm = listener_vm;
+
+	for (size_t i = 0; i < ucv_array_length(listener_registry); i += LISTENER_SLOTS) {
+		uc_value_t *this = ucv_array_get(listener_registry, i + LISTENER_SLOT_RES);
+		uc_value_t *func = ucv_array_get(listener_registry, i + LISTENER_SLOT_OVERRUN_CB);
+
+		if (!ucv_resource_data(this, "nl80211.listener") || !ucv_is_callable(func))
+			continue;
+
+		uc_vm_stack_push(vm, ucv_get(this));
+		uc_vm_stack_push(vm, ucv_get(func));
+
+		if (uc_vm_call(vm, true, 0) != EXCEPTION_NONE) {
+			uloop_end();
+			return;
+		}
+
+		ucv_put(uc_vm_stack_pop(vm));
+	}
+}
+
+static void
+uc_nl_evsock_rcvbuf_set(int size)
+{
+	int fd = nl_socket_get_fd(nl80211_conn.evsock);
+
+	/* SO_RCVBUFFORCE exceeds net.core.rmem_max but needs CAP_NET_ADMIN */
+	if (setsockopt(fd, SOL_SOCKET, SO_RCVBUFFORCE, &size, sizeof(size)) < 0)
+		setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &size, sizeof(size));
+
+	nl80211_conn.rcvbuf = size;
+}
+
+/*
+ * waitfor() and listener requests also read the event socket, so the
+ * handlers run from a timer, outside of those calls.
+ */
+static void
+uc_nl_evsock_overrun(void)
+{
+	if (nl80211_conn.rcvbuf < NL80211_EVSOCK_RCVBUF_MAX)
+		uc_nl_evsock_rcvbuf_set(nl80211_conn.rcvbuf * 2);
+
+	if (!nl80211_conn.evsock_fd.registered || !listener_vm)
+		return;
+
+	nl80211_conn.overrun_timer.cb = uc_nl_listener_overrun_notify;
+	uloop_timeout_set(&nl80211_conn.overrun_timer, 0);
+}
+
+static bool
+uc_nl_evsock_error_take(struct uloop_fd *fd)
+{
+	socklen_t len = sizeof(int);
+	int err = 0;
+
+	if (!fd->error)
+		return false;
+
+	fd->error = false;
+
+	if (getsockopt(fd->fd, SOL_SOCKET, SO_ERROR, &err, &len) < 0)
+		return false;
+
+	return err == ENOBUFS;
+}
+
+static bool
+uc_nl_recv_overrun(int err)
+{
+	return err == -NLE_NOMEM && errno == ENOBUFS;
+}
+
 static bool
 uc_nl_evsock_init(void)
 {
@@ -2675,6 +2844,8 @@ uc_nl_evsock_init(void)
 		nl80211_conn.evsock = NULL;
 		return false;
 	}
+
+	uc_nl_evsock_rcvbuf_set(NL80211_EVSOCK_RCVBUF_INIT);
 
 	return true;
 }
@@ -2729,6 +2900,7 @@ uc_nl_waitfor(uc_vm_t *vm, size_t nargs)
 	err = 0;
 
 	nl_cb_set(cb, NL_CB_SEQ_CHECK, NL_CB_CUSTOM, cb_seq, NULL);
+	nl_cb_set(cb, NL_CB_MSG_IN, NL_CB_CUSTOM, cb_evsock_msg, NULL);
 	nl_cb_set(cb, NL_CB_VALID, NL_CB_CUSTOM, cb_event, &ctx);
 	nl_cb_err(cb, NL_CB_CUSTOM, cb_errno, &err);
 
@@ -2743,7 +2915,8 @@ uc_nl_waitfor(uc_vm_t *vm, size_t nargs)
 		if (poll(&pfd, 1, ms) != 1)
 			break;
 
-		nl_recvmsgs(nl80211_conn.evsock, cb);
+		if (uc_nl_recv_overrun(nl_recvmsgs(nl80211_conn.evsock, cb)))
+			uc_nl_evsock_overrun();
 
 		if (ms > 0) {
 			clock_gettime(CLOCK_MONOTONIC, &end);
@@ -2772,9 +2945,28 @@ uc_nl_waitfor(uc_vm_t *vm, size_t nargs)
 	}
 }
 
+static bool
+uc_nl_evsock_readable(void)
+{
+	struct pollfd pfd = {
+		.fd = nl_socket_get_fd(nl80211_conn.evsock),
+		.events = POLLIN,
+	};
+	int n;
+
+	do
+		n = poll(&pfd, 1, 0);
+	while (n < 0 && errno == EINTR);
+
+	return n > 0;
+}
+
 static uc_value_t *
 uc_nl_request_common(struct nl_sock *sock, uc_vm_t *vm, size_t nargs)
 {
+	bool evsock = (sock == nl80211_conn.evsock);
+	bool overrun = false;
+	uint32_t seq = 0;
 	request_state_t st = { .vm = vm };
 	uc_value_t *cmd = uc_fn_arg(0);
 	uc_value_t *flags = uc_fn_arg(1);
@@ -2846,24 +3038,44 @@ uc_nl_request_common(struct nl_sock *sock, uc_vm_t *vm, size_t nargs)
 
 	nl_cb_set(cb, NL_CB_VALID, NL_CB_CUSTOM, cb_reply, &st);
 	nl_cb_set(cb, NL_CB_FINISH, NL_CB_CUSTOM, cb_done, &st);
-	nl_cb_set(cb, NL_CB_ACK, NL_CB_CUSTOM, cb_done, &st);
+	nl_cb_set(cb, NL_CB_ACK, NL_CB_CUSTOM, cb_done_ack, &st);
 	nl_cb_err(cb, NL_CB_CUSTOM, cb_errno, &ret);
 
-	if (sock == nl80211_conn.evsock) {
+	if (evsock) {
 		nl_cb_set(cb, NL_CB_SEQ_CHECK, NL_CB_CUSTOM, cb_seq, NULL);
-		nl_cb_set(cb, NL_CB_MSG_IN, NL_CB_CUSTOM, cb_evsock_msg, NULL);
+		nl_cb_set(cb, NL_CB_MSG_IN, NL_CB_CUSTOM, cb_evsock_msg, &seq);
 	}
 
 	nl_send_auto_complete(sock, msg);
+	seq = nlmsg_hdr(msg)->nlmsg_seq;
 
-	while (ret > 0 && st.state < STATE_REPLIED)
-		nl_recvmsgs(sock, cb);
+	while (ret > 0 && st.state < STATE_REPLIED) {
+		/* the kernel queues a reply before send() returns, and the
+		 * next part of a dump while recvmsg() empties the queue */
+		if (evsock && !uc_nl_evsock_readable()) {
+			nlmsg_free(msg);
+			nl_cb_put(cb);
+			ucv_put(st.res);
+
+			if (overrun)
+				err_return(NLE_NOMEM, "Reply lost to an event socket overrun");
+
+			err_return(NLE_AGAIN, "Reply missing on the event socket");
+		}
+
+		if (uc_nl_recv_overrun(nl_recvmsgs(sock, cb)) && evsock) {
+			uc_nl_evsock_overrun();
+			overrun = true;
+		}
+	}
 
 	nlmsg_free(msg);
 	nl_cb_put(cb);
 
-	if (ret < 0)
+	if (ret < 0) {
+		ucv_put(st.res);
 		err_return(ret, NULL);
+	}
 
 	switch (st.state) {
 	case STATE_REPLIED:
@@ -2873,6 +3085,7 @@ uc_nl_request_common(struct nl_sock *sock, uc_vm_t *vm, size_t nargs)
 		return ucv_boolean_new(true);
 
 	default:
+		ucv_put(st.res);
 		set_error(NLE_FAILURE, "Interrupted reply");
 
 		return ucv_boolean_new(false);
@@ -2888,8 +3101,13 @@ uc_nl_request_common(struct nl_sock *sock, uc_vm_t *vm, size_t nargs)
  * @param {number} cmd - The nl80211 command ID to execute
  * @param {number} flags - Netlink flags (optional, default: 0)
  * @param {Object} payload - Request payload object with attributes (optional)
- * @returns {Object|boolean} Response object from the kernel, or true for
- *                           successful acknowledgment without data
+ * @returns {?(Object|Object[]|boolean)} Response object from the kernel,
+ *                                       an array of objects for a dump
+ *                                       except of a single wiphy,
+ *                                       true for a successful
+ *                                       acknowledgement without data, or
+ *                                       null for a dump without entries
+ *                                       and on error
  * @example
  * // Get wireless device information
  * let response = request(const.NL80211_CMD_GET_WIPHY, 0, { wiphy: 0 });
@@ -2929,10 +3147,32 @@ uc_nl_request(uc_vm_t *vm, size_t nargs)
  * nlListener.close();
  */
 
+/*
+ * The kernel sets ENOBUFS once per congestion and ends the congestion only
+ * when the queue is empty, so drain the queue fully.
+ */
 static void
 uc_nl_listener_cb(struct uloop_fd *fd, unsigned int events)
 {
-	nl_recvmsgs(nl80211_conn.evsock, nl80211_conn.evsock_cb);
+	bool overrun = uc_nl_evsock_error_take(fd);
+	int err;
+
+	while (true) {
+		errno = 0;
+
+		err = nl_recvmsgs(nl80211_conn.evsock, nl80211_conn.evsock_cb);
+
+		if (uc_nl_recv_overrun(err)) {
+			overrun = true;
+			continue;
+		}
+
+		if (err < 0 || errno == EAGAIN || uloop_cancelled)
+			break;
+	}
+
+	if (overrun)
+		uc_nl_evsock_overrun();
 }
 
 /**
@@ -2977,7 +3217,7 @@ uc_nl_listener(uc_vm_t *vm, size_t nargs)
 	if (!fd->registered) {
 		fd->fd = nl_socket_get_fd(nl80211_conn.evsock);
 		fd->cb = uc_nl_listener_cb;
-		uloop_fd_add(fd, ULOOP_READ);
+		uloop_fd_add(fd, ULOOP_READ | ULOOP_ERROR_CB);
 	}
 
 	if (!nl80211_conn.evsock_cb) {
@@ -2987,16 +3227,18 @@ uc_nl_listener(uc_vm_t *vm, size_t nargs)
 			err_return(NLE_NOMEM, NULL);
 
 		nl_cb_set(cb, NL_CB_SEQ_CHECK, NL_CB_CUSTOM, cb_seq, NULL);
-		nl_cb_set(cb, NL_CB_VALID, NL_CB_CUSTOM, cb_listener_event, NULL);
+		nl_cb_set(cb, NL_CB_MSG_IN, NL_CB_CUSTOM, cb_evsock_msg, NULL);
+		nl_cb_set(cb, NL_CB_VALID, NL_CB_CUSTOM, cb_listener_dispatch, NULL);
 		nl80211_conn.evsock_cb = cb;
 	}
 
-	for (i = 0; i < ucv_array_length(listener_registry); i += 2) {
-		if (!ucv_array_get(listener_registry, i))
+	for (i = 0; i < ucv_array_length(listener_registry); i += LISTENER_SLOTS) {
+		if (!ucv_array_get(listener_registry, i + LISTENER_SLOT_RES))
 			break;
 	}
 
-	ucv_array_set(listener_registry, i + 1, ucv_get(cb_func));
+	ucv_array_set(listener_registry, i + LISTENER_SLOT_CB, ucv_get(cb_func));
+	ucv_array_set(listener_registry, i + LISTENER_SLOT_OVERRUN_CB, NULL);
 	l = xalloc(sizeof(*l));
 	l->index = i;
 	if (!uc_nl_fill_cmds(l->cmds, cmds)) {
@@ -3006,7 +3248,7 @@ uc_nl_listener(uc_vm_t *vm, size_t nargs)
 	}
 
 	rv = uc_resource_new(listener_type, l);
-	ucv_array_set(listener_registry, i, ucv_get(rv));
+	ucv_array_set(listener_registry, i + LISTENER_SLOT_RES, ucv_get(rv));
 	listener_vm = vm;
 
 	return rv;
@@ -3020,8 +3262,9 @@ uc_nl_listener_free(void *arg)
 	if (!l)
 		return;
 
-	ucv_array_set(listener_registry, l->index, NULL);
-	ucv_array_set(listener_registry, l->index + 1, NULL);
+	ucv_array_set(listener_registry, l->index + LISTENER_SLOT_RES, NULL);
+	ucv_array_set(listener_registry, l->index + LISTENER_SLOT_CB, NULL);
+	ucv_array_set(listener_registry, l->index + LISTENER_SLOT_OVERRUN_CB, NULL);
 	free(l);
 }
 
@@ -3057,6 +3300,62 @@ uc_nl_listener_set_commands(uc_vm_t *vm, size_t nargs)
 }
 
 /**
+ * Set the overrun handler of this listener
+ *
+ * The kernel drops event messages when the receive buffer of the event
+ * socket is full, and the lost events cannot be recovered. The module then
+ * enlarges the buffer and calls the overrun handler of each listener
+ * without arguments, from the event loop.
+ *
+ * Every event type can be lost, including deletions. The handler must dump
+ * each object type that the script keeps state for. It must treat every
+ * entry of the dump as new or changed, and every cached entry that is
+ * missing from the dump as deleted.
+ *
+ * @param {Function|null} handler - Function to call after an overrun, or
+ *                                  null to remove it
+ * @returns {?boolean} true on success, null if the listener is closed
+ * @example
+ * // Rebuild the interface cache after lost events
+ * listener.set_overrun_handler(() => {
+ *     error();
+ *
+ *     let dump = request(const.NL80211_CMD_GET_INTERFACE, const.NLM_F_DUMP);
+ *     let seen = {};
+ *
+ *     if (dump == null && error())
+ *         return;
+ *
+ *     for (let iface in dump ?? []) {
+ *         seen[iface.ifname] = true;
+ *         interfaces[iface.ifname] = iface;
+ *     }
+ *
+ *     for (let name in keys(interfaces))
+ *         if (!seen[name])
+ *             delete interfaces[name];
+ * });
+ */
+static uc_value_t *
+uc_nl_listener_set_overrun_handler(uc_vm_t *vm, size_t nargs)
+{
+	uc_nl_listener_t *l = uc_fn_thisval("nl80211.listener");
+	uc_value_t *handler = uc_fn_arg(0);
+
+	if (!l)
+		return NULL;
+
+	if (handler && !ucv_is_callable(handler)) {
+		uc_vm_raise_exception(vm, EXCEPTION_TYPE, "Invalid overrun handler");
+		return NULL;
+	}
+
+	ucv_array_set(listener_registry, l->index + LISTENER_SLOT_OVERRUN_CB, ucv_get(handler));
+
+	return ucv_boolean_new(true);
+}
+
+/**
  * Send a nl80211 request from the listener
  *
  * This method allows the listener to send its own nl80211 requests
@@ -3065,8 +3364,13 @@ uc_nl_listener_set_commands(uc_vm_t *vm, size_t nargs)
  * @param {number} cmd - The nl80211 command ID to execute
  * @param {number} flags - Netlink flags (optional, default: 0)
  * @param {Object} payload - Request payload object with attributes (optional)
- * @returns {Object|boolean} Response object from the kernel, or true for
- *                           successful acknowledgment without data
+ * @returns {?(Object|Object[]|boolean)} Response object from the kernel,
+ *                                       an array of objects for a dump
+ *                                       except of a single wiphy,
+ *                                       true for a successful
+ *                                       acknowledgement without data, or
+ *                                       null for a dump without entries
+ *                                       and on error
  * @example
  * // Listener sends its own request
  * let response = listener.request(const.NL80211_CMD_GET_STATION, 0, {
@@ -3558,6 +3862,7 @@ static const uc_function_list_t global_fns[] = {
 
 static const uc_function_list_t listener_fns[] = {
 	{ "set_commands",	uc_nl_listener_set_commands },
+	{ "set_overrun_handler",	uc_nl_listener_set_overrun_handler },
 	{ "request",		uc_nl_listener_request },
 	{ "close",			uc_nl_listener_close },
 };
