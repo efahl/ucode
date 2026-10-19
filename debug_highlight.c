@@ -110,10 +110,10 @@ static struct {
 	{ FG_BYELLOW, "\\<(while|if|else|elif|switch|case|default|for|in|endif|endfor|endwhile|endfunction)\\>", NULL },
 
 	/* keywords */
-	{ FG_BYELLOW, "\\<(export|import|try|catch|delete)\\>", NULL },
+	{ FG_BYELLOW, "\\<(export|import|try|catch|delete|typeof)\\>", NULL },
 
 	/* exit points */
-	{ FG_MAGENTA, "\\<(break|continue|return)\\>", NULL },
+	{ FG_MAGENTA, "\\<(break|continue|return|throw)\\>", NULL },
 
 	/* numeric literals */
 	{ FG_CYAN, "\\<([0-9]+\\.[0-9]+([eE][+-]?[0-9]+)?|[0-9]+[eE][+-]?[0-9]+)\\>", NULL },
