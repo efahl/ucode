@@ -121,6 +121,11 @@ __hidden extern const uc_function_list_t uc_stdlib_functions[];
  * slot, i.e. a function retired since that bytecode was compiled. */
 __hidden uc_cfn_ptr_t uc_stdlib_function_by_slot(size_t slot);
 
+/* Resolve a bytecode slot to its function's name, for the trace output and the
+ * disassembly listing; NULL as above, and also for an empty slot.
+ * Cross-library: called by modules (e.g. debug) from libucode, so it must stay exported. */
+const char *uc_stdlib_function_name_by_slot(size_t slot);
+
 /* Cross-library: called by modules (e.g. debug) from libucode, so it must stay exported. */
 bool uc_source_context_format(uc_stringbuf_t *buf, uc_source_t *src, size_t off, bool compact);
 

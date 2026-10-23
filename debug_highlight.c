@@ -826,8 +826,15 @@ debug_highlight_print_disassembly(FILE *out, const char *function,
 			else if (ins->have_call) {
 				dbuf_printf(&line, " : ");
 
-				if (ins->call_mcall)
+				if (ins->stdlib_name) {
+					dbuf_style(&line, &st_cyan);
+					dbuf_printf(&line, "%s", ins->stdlib_name);
+					dbuf_style(&line, NULL);
+					dbuf_printf(&line, ", ");
+				}
+				else if (ins->call_mcall) {
 					dbuf_printf(&line, "mcall, ");
+				}
 
 				dbuf_style(&line, &st_op);
 				dbuf_printf(&line, "%" PRIu32, ins->call_nargs);

@@ -1119,6 +1119,15 @@ uc_dump_insn(uc_vm_t *vm, uint8_t *pos, uc_vm_insn_t insn)
 		fprintf(stderr, "\t; (%s)", uc_vm_insn_to_name(vm->arg.u8));
 		break;
 
+	case I_STCALL: {
+		/* the operand packs the callee's uc_stdlib_functions[] slot in its
+		 * upper half, the argument count in the lower one */
+		const char *name = uc_stdlib_function_name_by_slot(vm->arg.u32 >> 16);
+
+		fprintf(stderr, "\t; %s", name ? name : "(?)");
+		break;
+	}
+
 	default:
 		break;
 	}

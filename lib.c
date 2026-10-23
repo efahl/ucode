@@ -6407,3 +6407,15 @@ uc_stdlib_function_by_slot(size_t slot)
 
 	return uc_stdlib_functions[slot].func;
 }
+
+/* Resolve a bytecode slot to the name of its function, for the trace output
+ * and the debugger's disassembly; returns NULL for slots out of range and for
+ * empty ones, i.e. functions retired since the bytecode was compiled. */
+const char *
+uc_stdlib_function_name_by_slot(size_t slot)
+{
+	if (slot >= ARRAY_SIZE(uc_stdlib_functions))
+		return NULL;
+
+	return uc_stdlib_functions[slot].name;
+}
