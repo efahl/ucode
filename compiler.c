@@ -2685,10 +2685,12 @@ uc_compiler_literal_follow(uc_compiler_t *compiler)
 	/* a literal enclosed in one that has been scanned already is known not to
 	 * be followed by an equals sign unless found back then */
 	if (pos > parser->scanned.from && pos < parser->scanned.to) {
+		uc_bracket_t probe = { .pos = pos };
+
 		if (!parser->scanned.count)
 			return UC_FOLLOW_OTHER;
 
-		hit = bsearch(&pos, parser->scanned.entries, parser->scanned.count,
+		hit = bsearch(&probe, parser->scanned.entries, parser->scanned.count,
 			sizeof(uc_bracket_t), uc_bracket_cmp);
 
 		if (!hit)

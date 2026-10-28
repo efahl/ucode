@@ -146,7 +146,8 @@ debug_proto_read(int fd, debug_proto_buf_t *buf, uc_vm_t *vm,
 	*payload_out = NULL;
 
 	for (;;) {
-		char *nl = memchr(buf->data, '\n', buf->len);
+		/* nothing has been buffered yet, so there is nothing to search in it */
+		char *nl = buf->len ? memchr(buf->data, '\n', buf->len) : NULL;
 
 		if (nl) {
 			line_len = (size_t)(nl - buf->data);
