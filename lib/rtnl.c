@@ -1059,8 +1059,11 @@ static const uc_nl_attr_spec_t link_vlan_attrs[] = {
 };
 
 static const uc_nl_attr_spec_t link_vrf_attrs[] = {
-	{ IFLA_VRF_PORT_TABLE, "port_table", DT_U32, DF_NO_SET, NULL },
 	{ IFLA_VRF_TABLE, "table", DT_U32, 0, NULL },
+};
+
+static const uc_nl_attr_spec_t link_vrf_slave_attrs[] = {
+	{ IFLA_VRF_PORT_TABLE, "port_table", DT_U32, DF_NO_SET, NULL },
 };
 
 static const uc_nl_attr_spec_t link_vxcan_attrs[] = {
@@ -1958,16 +1961,17 @@ uc_nl_convert_rta_numrange(const uc_nl_attr_spec_t *spec, struct nl_msg *msg, st
 #define LINK_TYPE(name) \
 	{ #name, link_##name##_attrs, ARRAY_SIZE(link_##name##_attrs) }
 
-static const struct {
+#define LINK_SLAVE_TYPE(name) \
+	{ #name, link_##name##_slave_attrs, ARRAY_SIZE(link_##name##_slave_attrs) }
+
+static const struct link_type {
 	const char *name;
 	const uc_nl_attr_spec_t *attrs;
 	size_t nattrs;
 } link_types[] = {
 	LINK_TYPE(bareudp),
 	LINK_TYPE(bond),
-	LINK_TYPE(bond_slave),
 	LINK_TYPE(bridge),
-	LINK_TYPE(bridge_slave),
 	LINK_TYPE(can),
 	LINK_TYPE(geneve),
 	LINK_TYPE(hsr),
@@ -1996,14 +2000,41 @@ static const struct {
 	LINK_TYPE(xfrm),
 };
 
+static const struct link_type link_slave_types[] = {
+	LINK_SLAVE_TYPE(bond),
+	LINK_SLAVE_TYPE(bridge),
+	LINK_SLAVE_TYPE(vrf),
+};
+
+static const uc_nl_attr_spec_t *
+link_attrs_lookup(const char *kind, size_t len, bool slave, size_t *nattrs)
+{
+	const struct link_type *types = slave ? link_slave_types : link_types;
+	size_t i, ntypes = slave ? ARRAY_SIZE(link_slave_types) : ARRAY_SIZE(link_types);
+
+	for (i = 0; i < ntypes; i++) {
+		if (strlen(types[i].name) != len || memcmp(types[i].name, kind, len))
+			continue;
+
+		*nattrs = types[i].nattrs;
+
+		return types[i].attrs;
+	}
+
+	*nattrs = 0;
+
+	return NULL;
+}
+
 static bool
 uc_nl_parse_rta_linkinfo(const uc_nl_attr_spec_t *spec, struct nl_msg *msg, char *base, uc_vm_t *vm, uc_value_t *val)
 {
-	const uc_nl_attr_spec_t *attrs = NULL;
+	const uc_nl_attr_spec_t *attrs;
 	struct nlattr *li_nla, *info_nla;
-	size_t i, nattrs = 0;
+	size_t nattrs;
 	char *kind, *p;
 	uc_value_t *k;
+	bool slave;
 
 	k = ucv_object_get(val, "type", NULL);
 	kind = ucv_string_get(k);
@@ -2016,22 +2047,16 @@ uc_nl_parse_rta_linkinfo(const uc_nl_attr_spec_t *spec, struct nl_msg *msg, char
 	if (!li_nla)
 		return nla_parse_error(spec, vm, val, "netlink message is full");
 
-	nla_put_string(msg, IFLA_INFO_KIND, kind);
-
-	for (i = 0; i < ARRAY_SIZE(link_types); i++) {
-		if (!strcmp(link_types[i].name, kind)) {
-			attrs = link_types[i].attrs;
-			nattrs = link_types[i].nattrs;
-			break;
-		}
-	}
-
 	p = strchr(kind, '_');
+	slave = p && !strcmp(p, "_slave");
 
-	if (!p || strcmp(p, "_slave"))
-		info_nla = nla_nest_start(msg, IFLA_INFO_DATA);
-	else
-		info_nla = nla_nest_start(msg, IFLA_INFO_SLAVE_DATA);
+	if (!slave)
+		nla_put_string(msg, IFLA_INFO_KIND, kind);
+
+	attrs = link_attrs_lookup(kind, slave ? (size_t)(p - kind) : strlen(kind),
+		slave, &nattrs);
+
+	info_nla = nla_nest_start(msg, slave ? IFLA_INFO_SLAVE_DATA : IFLA_INFO_DATA);
 
 	if (!info_nla)
 		return nla_parse_error(spec, vm, val, "netlink message is full");
@@ -2048,8 +2073,8 @@ uc_nl_parse_rta_linkinfo(const uc_nl_attr_spec_t *spec, struct nl_msg *msg, char
 static uc_value_t *
 uc_nl_convert_rta_linkinfo_data(uc_value_t *obj, size_t attr, struct nl_msg *msg, struct nlattr **tb, uc_vm_t *vm)
 {
-	const uc_nl_attr_spec_t *attrs = NULL;
-	size_t i, nattrs = 0;
+	const uc_nl_attr_spec_t *attrs;
+	size_t nattrs;
 	uc_value_t *v;
 	bool rv;
 
@@ -2060,13 +2085,8 @@ uc_nl_convert_rta_linkinfo_data(uc_value_t *obj, size_t attr, struct nl_msg *msg
 
 	ucv_object_add(obj, "type", v);
 
-	for (i = 0; i < ARRAY_SIZE(link_types); i++) {
-		if (!strcmp(link_types[i].name, ucv_string_get(v))) {
-			attrs = link_types[i].attrs;
-			nattrs = link_types[i].nattrs;
-			break;
-		}
-	}
+	attrs = link_attrs_lookup(ucv_string_get(v), ucv_string_length(v),
+		attr == IFLA_INFO_SLAVE_KIND, &nattrs);
 
 	attr = (attr == IFLA_INFO_KIND) ? IFLA_INFO_DATA : IFLA_INFO_SLAVE_DATA;
 
