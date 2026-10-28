@@ -3675,6 +3675,11 @@ uc_ubus_channel_req_cb(struct ubus_context *ctx, struct ubus_object *obj,
 	uc_ubus_connection_t *c = container_of(ctx, uc_ubus_connection_t, ctx);
 	uc_value_t *func, *args, *reqproto;
 
+	/* A message that was still buffered when the channel was lost reaches
+	 * this callback after the disconnect callback released the resource. */
+	if (!c->res)
+		return UBUS_STATUS_CONNECTION_FAILED;
+
 	func = ucv_resource_value_get(c->res, CONN_RES_CB);
 
 	if (!ucv_is_callable(func))
