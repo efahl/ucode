@@ -1,0 +1,35 @@
+Complex arguments and return values of C functions are represented as
+[ real, imaginary ] arrays.
+
+Call libc functions taking and returning float and double complex values.
+
+-- Testcase --
+{%
+import * as ffi from 'ffi';
+
+let cabs = ffi.C.wrap('double cabs(double complex)');
+let cabsf = ffi.C.wrap('float cabsf(float complex)');
+let cimag = ffi.C.wrap('double cimag(double complex)');
+let crealf = ffi.C.wrap('float crealf(float complex)');
+let conj = ffi.C.wrap('double complex conj(double complex)');
+let conjf = ffi.C.wrap('float complex conjf(float complex)');
+let cproj = ffi.C.wrap('double complex cproj(double complex)');
+
+print("cabs: ", cabs([ 3.0, 4.0 ]), "\n");
+print("cabsf: ", cabsf([ 6.0, 8.0 ]), "\n");
+print("cimag: ", cimag([ 1.5, -2.5 ]), "\n");
+print("crealf: ", crealf([ 1.5, -2.5 ]), "\n");
+print("conj: ", conj([ 3.0, 4.0 ]), "\n");
+print("conjf: ", conjf([ 1.5, -2.5 ]), "\n");
+print("cproj: ", cproj([ -0.5, 0.25 ]), "\n");
+-- End --
+
+-- Expect stdout --
+cabs: 5
+cabsf: 10
+cimag: -2.5
+crealf: 1.5
+conj: [ 3.0, -4.0 ]
+conjf: [ 1.5, 2.5 ]
+cproj: [ -0.5, 0.25 ]
+-- End --
