@@ -1142,6 +1142,10 @@ uc_ubus_call_cb(struct ubus_request *req, int type, struct blob_attr *msg)
 	else if (!res->res) {
 		res->res = val;
 	}
+	else {
+		/* single-return mode keeps the first reply only */
+		ucv_put(val);
+	}
 }
 
 static void
@@ -1403,6 +1407,14 @@ uc_ubus_call_common(uc_vm_t *vm, uc_ubus_connection_t *c, uc_ubus_call_res_t *re
 			ubus_abort_request(&c->ctx, &defer.request);
 		else
 			rv = ubus_complete_request(&c->ctx, &defer.request, c->timeout * 1000);
+	}
+
+	/* replies already converted by uc_ubus_call_cb() are ours to release when
+	 * the request ends non-OK; the callers only hand res->res to the script on
+	 * success */
+	if (rv != UBUS_STATUS_OK) {
+		ucv_put(res->res);
+		res->res = NULL;
 	}
 
 	return rv;
